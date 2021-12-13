@@ -20,13 +20,21 @@ DEFINE_string(image_dir, "examples/media/",
 class WUserInput : public op::WorkerProducer<std::shared_ptr<std::vector<std::shared_ptr<op::Datum>>>>
 {
 public:
-    WUserInput(const std::string &directoryPath) : mImageFiles{op::getFilesOnDirectory(directoryPath, op::Extensions::Images)}, // For all basic image formats
-                                                   // If we want only e.g., "jpg" + "png" images
-                                                   // mImageFiles{op::getFilesOnDirectory(directoryPath, std::vector<std::string>{"jpg", "png"})},
-                                                   mCounter{0}
+    WUserInput(std::vector<uint32_t> cam_ids, bool use3d)
+        : mUse3d(use3d),
+          mParamReader(std::make_shared<op::CameraParameterReader>())
     {
-        if (mImageFiles.empty())
-            op::error("No images found on: " + directoryPath, __LINE__, __FUNCTION__, __FILE__);
+        for (const auto &cam_id : cam_ids)
+        {
+            mCams.emplace_back(std::make_shared<op::WebcamReader>(cam_id));
+        }
+        if (use3d)
+        {
+            mParamReader->readParameters(FLAGS_calibration_dir);
+            mIntrinsics = mParamReader->getCameraIntrinsics();
+            mExtrinsics = mParamReader->getCameraExtrinsics();
+            mMatrices = mParamReader->getCameraMatrices();
+        }
     }
 
     void initializationOnThread() {}
@@ -35,39 +43,44 @@ public:
     {
         try
         {
-            // Close program when empty frame
-            if (mImageFiles.size() <= mCounter)
+            std::lock_guard<std::mutex> g(lock);
+            if (mBlocked.empty())
             {
-                op::opLog("Last frame read and added to queue. Closing program after it is processed.",
-                          op::Priority::High);
-                // This funtion stops this worker, which will eventually stop the whole thread system once all the
-                // frames have been processed
-                this->stop();
-                return nullptr;
-            }
-            else
-            {
-                // Create new datum
-                auto datumsPtr = std::make_shared<std::vector<std::shared_ptr<op::Datum>>>();
-                datumsPtr->emplace_back();
-                auto &datumPtr = datumsPtr->at(0);
-                datumPtr = std::make_shared<op::Datum>();
 
-                // Fill datum
-                const cv::Mat cvInputData = cv::imread(mImageFiles.at(mCounter++));
-                datumPtr->cvInputData = OP_CV2OPCONSTMAT(cvInputData);
-
-                // If empty frame -> return nullptr
-                if (datumPtr->cvInputData.empty())
+                for (size_t i = 0; i < mCams.size(); i++)
                 {
-                    op::opLog("Empty frame detected on path: " + mImageFiles.at(mCounter - 1) + ". Closing program.",
-                              op::Priority::High);
-                    this->stop();
-                    datumsPtr = nullptr;
-                }
+                    auto datumsPtr = std::make_shared<std::vector<std::shared_ptr<op::Datum>>>();
+                    // Create new datum
+                    datumsPtr->emplace_back();
+                    auto &datum = datumsPtr->back();
+                    datum = std::make_shared<op::Datum>();
 
-                return datumsPtr;
+                    // Fill datum
+                    datum->cvInputData = mCams[i]->getFrame();
+                    datum->cvOutputData = datum->cvInputData;
+                    datum->subId = i;
+                    datum->subIdMax = mCams.size() - 1;
+                    if (mUse3d)
+                    {
+                        datum->cameraIntrinsics = mIntrinsics[i];
+                        datum->cameraExtrinsics = mExtrinsics[i];
+                        datum->cameraMatrix = mMatrices[i];
+                    }
+
+                    // If empty frame -> return nullptr
+                    if (datum->cvInputData.empty())
+                    {
+                        this->stop();
+                        return nullptr;
+                    }
+
+                    mBlocked.push(datumsPtr);
+                }
             }
+
+            auto ret = mBlocked.front();
+            mBlocked.pop();
+            return ret;
         }
         catch (const std::exception &e)
         {
@@ -78,8 +91,14 @@ public:
     }
 
 private:
-    const std::vector<std::string> mImageFiles;
-    unsigned long long mCounter;
+    bool mUse3d;
+    std::shared_ptr<op::CameraParameterReader> mParamReader;
+    std::vector<cv::Mat> mIntrinsics;
+    std::vector<cv::Mat> mExtrinsics;
+    std::vector<cv::Mat> mMatrices;
+    std::vector<std::shared_ptr<op::WebcamReader>> mCams;
+    std::queue<std::shared_ptr<std::vector<std::shared_ptr<op::Datum>>>> mBlocked;
+    std::mutex lock;
 };
 
 void configureWrapper(op::Wrapper &opWrapper)

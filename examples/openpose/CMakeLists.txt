@@ -1,5 +1,7 @@
 set(EXAMPLE_FILES
-    openpose.cpp)
+    openpose.cpp
+    camera_working.cpp
+    camera_experiment.cpp)
 
 foreach(EXAMPLE_FILE ${EXAMPLE_FILES})
 
